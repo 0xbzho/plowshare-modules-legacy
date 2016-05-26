@@ -1,5 +1,5 @@
-# Plowshare uploadable.ch module
-# Copyright (c) 2014 Plowshare team
+# Plowshare uploadable.ch/bigfile.to module
+# Copyright (c) 2016 Ben Zho
 #
 # This file is part of Plowshare.
 #
@@ -16,13 +16,13 @@
 # You should have received a copy of the GNU General Public License
 # along with Plowshare.  If not, see <http://www.gnu.org/licenses/>.
 
-MODULE_UPLOADABLE_CH_REGEXP_URL='https\?://\(www\.\)\?uploadable\.ch/'
+MODULE_UPLOADABLE_CH_REGEXP_URL='https\?://\(www\.\)\?\(bigfile\.to\|uploadable\.ch\)/'
 
 MODULE_UPLOADABLE_CH_DOWNLOAD_OPTIONS="
 AUTH,a,auth,a=USER:PASSWORD,User account"
 MODULE_UPLOADABLE_CH_DOWNLOAD_RESUME=no
 MODULE_UPLOADABLE_CH_DOWNLOAD_FINAL_LINK_NEEDS_COOKIE=no
-MODULE_UPLOADABLE_CH_DOWNLOAD_SUCCESSIVE_INTERVAL=
+MODULE_UPLOADABLE_CH_DOWNLOAD_SUCCESSIVE_INTERVAL=3600
 
 MODULE_UPLOADABLE_CH_UPLOAD_OPTIONS="
 AUTH,a,auth,a=USER:PASSWORD,User account
@@ -53,23 +53,19 @@ uploadable_ch_login() {
     fi
 }
 
-# Output a uploadable.ch file download URL and name
+# Output a bigfile.to file download URL and name
 # $1: cookie file
-# $2: uploadable.ch url
+# $2: uploadable.ch/bigfile.to url
 # stdout: file download link
 #         file name
 uploadable_ch_download() {
     local -r COOKIE_FILE=$1
-    local URL=$(replace '://uploadable.ch' '://www.uploadable.ch' <<< "$2")
-    local -r BASE_URL='https://www.uploadable.ch'
+    local URL=$2
+    local -r BASE_URL='https://www.bigfile.to'
+    local REAL_URL PAGE LOCATION WAIT_TIME SHORTCODE FAIL_REASON
 
-    local REAL_URL PAGE LOCATION WAIT_TIME
-
-    # Get a canonical URL for this file.
-    REAL_URL=$(curl -I "$URL" | grep_http_header_location_quiet) || return
-    if test "$REAL_URL"; then
-        URL="$REAL_URL"
-    fi
+    SHORTCODE=$(parse . '/file/\([^/]\+\)' <<< "$URL") || return
+    URL=${BASE_URL}/file/$SHORTCODE
     readonly URL
 
     if [ -n "$AUTH" ]; then
@@ -103,10 +99,9 @@ uploadable_ch_download() {
     fi
 
     if match 'var reCAPTCHA_publickey' "$PAGE"; then
-        local PUBKEY WCI CHALLENGE WORD ID SHORTCODE
+        local PUBKEY WCI CHALLENGE WORD ID
         # http://www.google.com/recaptcha/api/challenge?k=
         PUBKEY=$(parse 'var reCAPTCHA_publickey' "var reCAPTCHA_publickey='\([^']\+\)" <<< "$PAGE") || return
-        SHORTCODE=$(parse . 'uploadable.ch/file/\([^/]\+\)' <<< "$URL") || return
     fi
 
     PAGE=$(curl -b "$COOKIE_FILE" \
@@ -120,9 +115,28 @@ uploadable_ch_download() {
         -d 'checkDownload=check' \
         "$URL") || return
 
-    if match '"fail":"timeLimit"' "$PAGE"; then
-        return $ERR_LINK_TEMP_UNAVAILABLE
-    fi
+    FAIL_REASON=$(parse_json_quiet 'fail' <<<"$PAGE")
+    case "$FAIL_REASON" in
+	'captchaFail')
+            WAIT_TIME=$(parse_json 'waitTime' <<<"$PAGE")
+            log_debug "got captchaFail; further wait time of $WAIT_TIME seconds"
+            wait $WAIT_TIME || return
+	    ;;
+	'timeLimit')
+            # TODO: POST $URL find wait time
+            # <div class="errorMsg">
+            # <div class="clear"></div>
+            # <div class="icon_err">
+            # <h1>Please wait for 60 minutes  to download the next file.</h1>Upgrade to Premium to enjoy download without any restrictions.                    </div>
+            return $ERR_LINK_TEMP_UNAVAILABLE
+	    ;;
+	'')
+	    ;;
+	*)
+	    log_debug "checkDownload=check failed: $FAIL_REASON"
+	    return $ERR_FATAL
+	    ;;
+    esac
 
     if ! match '"success":"showCaptcha"' "$PAGE"; then
         return $ERR_FATAL
@@ -138,9 +152,14 @@ uploadable_ch_download() {
             -d "recaptcha_shortencode_field=$SHORTCODE" \
             "$BASE_URL/checkReCaptcha.php") || return
 
-        if ! match '"success":1' "$PAGE"; then
+        # Returns: {"success":0,"error":"incorrect-captcha-sol"}
+        if match '"error":"incorrect-captcha-sol"' "$PAGE"; then
             captcha_nack $ID
             return $ERR_CAPTCHA
+        fi
+        if ! match '"success":1' "$PAGE"; then
+	    log_debug "checkReCaptcha: unexpected response: $PAGE"
+            return $ERR_FATAL
         fi
 
         captcha_ack $ID
@@ -208,7 +227,7 @@ uploadable_ch_check_folder() {
     echo "$FOLDER_ID"
 }
 
-# Upload a file to uploadable.ch
+# Upload a file to bigfile.to
 # $1: cookie file
 # $2: file path or remote url
 # $3: remote filename
@@ -217,7 +236,7 @@ uploadable_ch_upload() {
     local -r COOKIE_FILE=$1
     local -r FILE=$2
     local -r DEST_FILE=$3
-    local -r BASE_URL='https://www.uploadable.ch'
+    local -r BASE_URL='https://www.bigfile.to'
 
     local PAGE UPLOAD_URL FILE_ID FILE_NAME DEL_CODE
 
@@ -321,17 +340,17 @@ uploadable_ch_upload() {
         fi
     fi
 
-    echo "https://www.uploadable.ch/file/$FILE_ID/$FILE_NAME"
-    echo "https://www.uploadable.ch/file/$FILE_ID/delete/$DEL_CODE"
+    echo "${BASE_URL}/file/$FILE_ID/$FILE_NAME"
+    echo "${BASE_URL}/file/$FILE_ID/delete/$DEL_CODE"
 }
 
 # Probe a download URL
 # $1: cookie file (unused here)
-# $2: uploadable.ch url
+# $2: uploadable.ch/bigfile.to url
 # $3: requested capability list
 # stdout: 1 capability per line
 uploadable_ch_probe() {
-    local -r URL=$(replace '://uploadable.ch' '://www.uploadable.ch' <<< "$2")
+    local -r URL=$2
     local -r REQ_IN=$3
     local PAGE FILE_NAME FILE_SIZE REQ_OUT
 
@@ -356,12 +375,12 @@ uploadable_ch_probe() {
     echo $REQ_OUT
 }
 
-# List a uploadable.ch web folder URL
+# List a uploadable.ch/bigfile.to web folder URL
 # $1: folder URL
 # $2: recurse subfolders (null string means not selected)
 # stdout: list of links and file names (alternating)
 uploadable_ch_list() {
-    local -r URL=$(replace '://uploadable.ch' '://www.uploadable.ch' <<< "$1")
+    local -r URL=$1
     local -r REC=$2
     local PAGE LINKS NAMES
 
@@ -377,11 +396,11 @@ uploadable_ch_list() {
     list_submit "$LINKS" "$NAMES"
 }
 
-# Delete a file uploaded to uploadable.ch
+# Delete a file uploaded to uploadable.ch/bigfile.to
 # $1: cookie file (unused here)
 # $2: delete url
 uploadable_ch_delete() {
-    local URL=$(replace '://uploadable.ch' '://www.uploadable.ch' <<< "$2")
+    local URL=$2
     local PAGE
 
     PAGE=$(curl -L "$URL") || return
